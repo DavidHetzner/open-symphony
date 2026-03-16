@@ -1150,6 +1150,333 @@ Note:
 
 - Workspaces are intentionally preserved after successful runs.
 
+## 10A. Claude Code Provider Protocol
+
+This section defines the contract for integrating Claude Code CLI as an alternative coding agent
+provider. Where Section 10 describes the Codex app-server (a long-lived JSON-RPC subprocess), this
+section describes the Claude Code CLI (per-turn subprocesses with session resumption).
+
+The provider is selected via `codex.provider: claude` in the workflow front matter.
+
+### 10A.1 Execution Model
+
+Claude Code uses a fundamentally different execution model than Codex:
+
+- **Codex**: one long-lived app-server subprocess per worker run; multiple turns are issued as
+  JSON-RPC messages on the same process's stdio.
+- **Claude Code**: one short-lived CLI subprocess per turn; session continuity across turns is
+  maintained via `--resume <session_id>`.
+
+The orchestrator's worker loop (Section 16.5) must account for this difference: instead of keeping
+a single subprocess alive and issuing `turn/start` messages, the worker spawns a fresh CLI process
+for each turn and passes the previous session ID for resumption.
+
+### 10A.2 Configuration
+
+When `codex.provider` is `claude`, the following config fields apply:
+
+- `codex.claude_command` (string)
+  - Default: `claude`
+  - Path or name of the Claude Code CLI executable.
+- `codex.turn_timeout_ms` (integer)
+  - Default: `3600000` (1 hour)
+  - Maximum wall-clock time for a single CLI invocation.
+- `codex.stall_timeout_ms` (integer)
+  - Default: `300000` (5 minutes)
+  - Enforced by the orchestrator based on event inactivity (same as Codex).
+
+The following Codex-specific fields are ignored when `provider` is `claude`:
+
+- `codex.command` (the Codex app-server command)
+- `codex.approval_policy`, `codex.thread_sandbox`, `codex.turn_sandbox_policy` (Claude Code manages
+  permissions via `--dangerously-skip-permissions` or interactive prompts)
+- `codex.read_timeout_ms` (no startup handshake to time out)
+
+### 10A.3 Launch Contract
+
+Subprocess launch parameters for each turn:
+
+- Command: `<codex.claude_command>`
+- Arguments (first turn):
+  ```
+  claude --print --output-format stream-json --verbose \
+         --max-turns <agent.max_turns> \
+         --dangerously-skip-permissions \
+         -p -
+  ```
+- Arguments (continuation turn):
+  ```
+  claude --print --output-format stream-json --verbose \
+         --max-turns <agent.max_turns> \
+         --dangerously-skip-permissions \
+         --resume <session_id> \
+         -p -
+  ```
+- Working directory: workspace path
+- Stdout: line-delimited JSON events (the stream-json protocol)
+- Stderr: diagnostic output, not part of the protocol stream
+- Stdin: the rendered prompt text, followed by EOF (stream close)
+
+Critical implementation notes:
+
+- **Prompt delivery via stdin**: The prompt MUST be written to the subprocess's stdin and the stdin
+  stream MUST be closed (EOF) immediately after. Passing long prompts via the `-p` argument directly
+  causes shell escaping failures with multi-line content, special characters, and prompts exceeding
+  OS argument length limits. The `-p -` flag instructs Claude Code to read the prompt from stdin.
+- **Do not use `shell: true`** when spawning the subprocess. Spawning through a shell
+  (`/bin/sh -c "claude ..."`) creates an intermediate shell process; killing that shell process does
+  NOT kill the underlying `claude` child process, leading to orphaned zombie processes that
+  accumulate across retries. Spawn the CLI binary directly.
+- **`--output-format stream-json` requires `--verbose`**: The `stream-json` output format is only
+  available when `--verbose` is also set. Using `--output-format json` with `--verbose` causes the
+  CLI to hang indefinitely. The only working combination for streaming structured output is
+  `--output-format stream-json --verbose`.
+
+### 10A.4 Stream-JSON Protocol Messages
+
+Claude Code emits line-delimited JSON objects on stdout. Each line is a complete JSON object with a
+`type` field. The orchestrator client must parse each line independently.
+
+#### 10A.4.1 System Init Event
+
+Emitted once at startup before any model interaction.
+
+```json
+{
+  "type": "system",
+  "subtype": "init",
+  "cwd": "/abs/workspace",
+  "session_id": "<uuid>",
+  "model": "claude-opus-4-6[1m]",
+  "tools": ["Bash", "Read", "Write", "Edit", ...],
+  "permissionMode": "bypassPermissions",
+  "claude_code_version": "2.1.76"
+}
+```
+
+Required extractions:
+
+- `session_id`: store as the conversation/session identifier for `--resume` on subsequent turns.
+- `model`: log for observability.
+- Emit `session_started` event to the orchestrator with the `session_id`.
+
+#### 10A.4.2 Assistant Message Event
+
+Emitted when the model produces a response (text or tool use).
+
+```json
+{
+  "type": "assistant",
+  "message": {
+    "model": "claude-opus-4-6",
+    "role": "assistant",
+    "content": [
+      {"type": "text", "text": "I'll create the backend server..."},
+      {"type": "tool_use", "id": "toolu_...", "name": "Write", "input": {...}}
+    ],
+    "usage": {
+      "input_tokens": 3,
+      "cache_creation_input_tokens": 6365,
+      "cache_read_input_tokens": 8790,
+      "output_tokens": 42
+    }
+  },
+  "session_id": "<uuid>"
+}
+```
+
+Required extractions:
+
+- `message.usage`: extract token counts for live dashboard updates. The total input token count
+  should be computed as `input_tokens + cache_read_input_tokens`. Cache creation tokens represent
+  one-time prompt caching overhead and may be tracked separately.
+- `message.content`: extract text content for the `last_message` observability field. Truncate to a
+  reasonable length (200 characters recommended).
+- `session_id`: update the stored session identifier if present.
+
+#### 10A.4.3 User/Tool Result Event
+
+Emitted when a tool execution completes (file written, command executed, etc.).
+
+```json
+{
+  "type": "user",
+  "message": {
+    "role": "user",
+    "content": [
+      {"tool_use_id": "toolu_...", "type": "tool_result", "content": "File created successfully"}
+    ]
+  },
+  "session_id": "<uuid>",
+  "tool_use_result": {
+    "type": "create",
+    "filePath": "/abs/workspace/server.js"
+  }
+}
+```
+
+No required extractions. May be logged for debugging.
+
+#### 10A.4.4 Rate Limit Event
+
+Emitted after each model response to report rate limit status.
+
+```json
+{
+  "type": "rate_limit_event",
+  "rate_limit_info": {
+    "status": "allowed",
+    "resetsAt": 1773691200,
+    "rateLimitType": "five_hour",
+    "overageStatus": "allowed",
+    "overageResetsAt": 1773691200,
+    "isUsingOverage": false
+  },
+  "session_id": "<uuid>"
+}
+```
+
+Required extractions:
+
+- `rate_limit_info`: forward to the orchestrator's `codex_rate_limits` state field for dashboard
+  display.
+- If `status` is not `allowed`, the orchestrator should log a warning. A `rate_limit_event` with
+  `status: "blocked"` means the next turn will likely fail or be delayed.
+
+#### 10A.4.5 Result Event (Turn Completion)
+
+Emitted once when the CLI process is about to exit. This is the final event on stdout.
+
+```json
+{
+  "type": "result",
+  "subtype": "success",
+  "is_error": false,
+  "duration_ms": 45230,
+  "duration_api_ms": 44800,
+  "num_turns": 12,
+  "result": "I've created the backend server with...",
+  "stop_reason": "end_turn",
+  "session_id": "<uuid>",
+  "total_cost_usd": 0.85,
+  "usage": {
+    "input_tokens": 1200,
+    "cache_creation_input_tokens": 8000,
+    "cache_read_input_tokens": 45000,
+    "output_tokens": 3500
+  }
+}
+```
+
+Important `subtype` values:
+
+- `success`: the agent completed normally (reached `end_turn` or exhausted its work).
+- `error_max_turns`: the agent hit the `--max-turns` limit. This is NOT an error; the orchestrator
+  should treat it as a normal completion and schedule a continuation turn if the issue is still
+  active.
+- `error`: a hard failure occurred during the turn.
+
+Required extractions:
+
+- `session_id`: store for `--resume` on the next turn.
+- `usage`: emit final token usage to the orchestrator. This is the authoritative cumulative usage
+  for the entire CLI invocation.
+- `subtype`: map to orchestrator turn outcome (`success` or `error_max_turns` -> normal exit;
+  `error` -> abnormal exit).
+- `total_cost_usd`: log for cost tracking.
+
+### 10A.5 Session Continuity via `--resume`
+
+Claude Code maintains conversation history server-side. The `--resume <session_id>` flag instructs
+the CLI to continue a previous conversation rather than starting fresh.
+
+Continuity rules:
+
+- The first turn in a worker run MUST NOT use `--resume` (no prior session exists).
+- After the first turn completes, the `session_id` from the `system.init` or `result` event MUST be
+  stored.
+- All subsequent turns in the same worker run MUST pass `--resume <session_id>`.
+- The continuation prompt (second turn onward) should be short guidance text, not a repeat of the
+  original task prompt, since the full conversation history is preserved server-side.
+- If a `--resume` invocation fails (for example, the session expired server-side), the worker should
+  fall back to a fresh first turn with the full rendered prompt.
+
+Session lifetime:
+
+- Claude Code sessions are persisted to `~/.claude/` on the host machine.
+- Sessions do not expire within a single worker run's typical lifetime.
+- After a service restart, old session IDs may still be resumable if the session files exist on
+  disk, but implementations should not rely on this.
+
+### 10A.6 Process Lifecycle and Cleanup
+
+Unlike the Codex app-server (which is a single long-lived process), each Claude Code turn is an
+independent subprocess. This creates unique lifecycle management requirements.
+
+Process termination:
+
+- When the orchestrator needs to cancel a running turn (timeout, reconciliation, or shutdown), it
+  must terminate the active CLI subprocess.
+- Send `SIGTERM` first. If the process does not exit within 5 seconds, send `SIGKILL`.
+- The `stopSession` method must track and kill the currently running subprocess if one exists.
+
+Zombie prevention:
+
+- Do NOT spawn the CLI through a shell wrapper (`shell: true` or `bash -lc`). This creates a
+  shell parent process and a `claude` child process. Killing the shell does NOT propagate the signal
+  to the child, leaving orphaned `claude` processes that consume memory and API quota.
+- If shell spawning is unavoidable (for example, to resolve `$PATH`), use `detached: true` and kill
+  the entire process group via `process.kill(-pid, signal)`.
+- Implementations MUST verify on cancellation/timeout that no orphaned `claude` processes remain.
+
+Resource accounting:
+
+- Each CLI invocation spawns a full Node.js runtime (~150-250 MB resident memory).
+- The `agent.max_concurrent_agents` limit applies to concurrent CLI subprocesses across all issues.
+- Implementations should monitor for accumulated zombie processes on long-running deployments.
+
+### 10A.7 Timeouts and Error Mapping
+
+Timeouts:
+
+- `codex.turn_timeout_ms`: maximum wall-clock time for a single CLI subprocess. When exceeded, kill
+  the process and fail the turn.
+- `codex.stall_timeout_ms`: enforced by the orchestrator's reconciliation loop based on the time
+  since the last `assistant` or `result` event was received on stdout. This catches cases where the
+  CLI process is alive but not producing output (for example, stuck waiting for API response).
+
+Error mapping (recommended normalized categories):
+
+- `claude_not_found`: the `claude` executable was not found on `$PATH` or the configured path.
+- `invalid_workspace_cwd`: the workspace directory does not exist or is not a directory.
+- `turn_timeout`: the CLI subprocess exceeded `codex.turn_timeout_ms`.
+- `turn_failed`: the CLI exited with a non-zero exit code, or the `result` event had
+  `subtype: "error"`.
+- `process_exit`: the CLI subprocess exited unexpectedly before emitting a `result` event.
+- `session_expired`: a `--resume` invocation failed because the session no longer exists.
+
+Exit code semantics:
+
+- Exit code `0`: normal completion. Parse the `result` event from stdout.
+- Exit code `1`: general error. The stderr output may contain diagnostic information.
+- Exit code `143` (`SIGTERM`): the process was killed by the orchestrator (timeout or cancellation).
+  This is expected and should not trigger error logging beyond the timeout/cancellation reason.
+
+### 10A.8 Differences from Codex Provider (Summary)
+
+| Aspect | Codex app-server | Claude Code CLI |
+|---|---|---|
+| Process model | One long-lived subprocess per worker | One subprocess per turn |
+| Protocol | JSON-RPC over stdio (bidirectional) | Stream-JSON on stdout (unidirectional) |
+| Session continuity | Same subprocess, same thread ID | `--resume <session_id>` on new subprocess |
+| Prompt delivery | JSON-RPC `turn/start` message | Stdin pipe with `-p -` |
+| Approval handling | Client sends approval responses | `--dangerously-skip-permissions` (all auto-approved) |
+| Client-side tools | Supported via JSON-RPC tool protocol | Not supported (Claude Code has built-in tools) |
+| Sandbox control | Configurable per-turn sandbox policy | Managed by Claude Code internally |
+| Token streaming | Inline in protocol events | `assistant` events with `message.usage` |
+| Turn completion | `turn/completed` JSON-RPC notification | `result` event + process exit |
+| Process cleanup | Kill one process | Must prevent orphaned processes (no shell wrapper) |
+
 ## 11. Issue Tracker Integration Contract (Linear-Compatible)
 
 ### 11.1 Required Operations
@@ -2036,6 +2363,32 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
   - top-level GraphQL `errors` produce `success=false` while preserving the GraphQL body
   - invalid arguments, missing auth, and transport failures return structured failure payloads
   - unsupported tool names still fail without stalling the session
+
+### 17.5A Claude Code CLI Client
+
+- Provider selection uses `codex.provider` config field; `claude` selects the Claude Code path
+- Launch command spawns `claude` directly without a shell wrapper to prevent orphaned processes
+- CLI arguments include `--print --output-format stream-json --verbose --dangerously-skip-permissions`
+- `--output-format stream-json` MUST be paired with `--verbose`; without `--verbose` the CLI errors
+- `--output-format json` (without `stream-`) MUST NOT be used with `--verbose`; the combination
+  causes the CLI to hang indefinitely
+- Prompt is delivered via stdin pipe (`-p -`), NOT as a command-line argument
+- Long prompts passed directly via `-p "<text>"` fail due to shell escaping of newlines, quotes,
+  and OS argument length limits
+- Stdin is closed (EOF) immediately after writing the prompt
+- First turn does not include `--resume`; subsequent turns include `--resume <session_id>`
+- `session_id` is extracted from the `system.init` event's `session_id` field
+- stdout is parsed line-by-line as JSON; each line is an independent JSON object with a `type` field
+- `system.init` event is parsed and `session_id` is stored
+- `assistant` events extract `message.usage` for live token accounting
+- `rate_limit_event` events forward `rate_limit_info` to the orchestrator
+- `result` event with `subtype: "success"` or `"error_max_turns"` is treated as normal completion
+- `result` event with `subtype: "error"` is treated as abnormal exit
+- Non-zero exit codes (except 143/SIGTERM) are treated as turn failure
+- Turn timeout kills the process with SIGTERM, then SIGKILL after 5 seconds
+- No orphaned `claude` processes remain after timeout or cancellation
+- Token counts include `cache_read_input_tokens` in the effective input total
+- `--resume` failures fall back to a fresh turn with the full rendered prompt
 
 ### 17.6 Observability
 
