@@ -157,7 +157,9 @@ defmodule SymphonyElixir.Config.Schema do
 
     @primary_key false
     embedded_schema do
+      field(:provider, :string, default: "codex")
       field(:command, :string, default: "codex app-server")
+      field(:claude_command, :string, default: "claude")
 
       field(:approval_policy, StringOrMap,
         default: %{
@@ -182,7 +184,9 @@ defmodule SymphonyElixir.Config.Schema do
       |> cast(
         attrs,
         [
+          :provider,
           :command,
+          :claude_command,
           :approval_policy,
           :thread_sandbox,
           :turn_sandbox_policy,
@@ -193,6 +197,7 @@ defmodule SymphonyElixir.Config.Schema do
         empty_values: []
       )
       |> validate_required([:command])
+      |> validate_inclusion(:provider, ["codex", "claude"])
       |> validate_number(:turn_timeout_ms, greater_than: 0)
       |> validate_number(:read_timeout_ms, greater_than: 0)
       |> validate_number(:stall_timeout_ms, greater_than_or_equal_to: 0)
