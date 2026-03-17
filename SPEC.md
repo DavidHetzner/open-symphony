@@ -769,6 +769,58 @@ Note:
 - Retry handling mainly operates on active candidates and releases claims when the issue is absent,
   rather than performing terminal cleanup itself.
 
+### 8.4.1 Rate Limit Pause (Global Dispatch Suspension)
+
+Coding agent APIs enforce rate limits. When the agent runtime reports a rate limit rejection, the
+orchestrator must suspend all dispatch activity until the rate limit resets. Without this behavior,
+the orchestrator enters a destructive retry loop: every dispatched worker hits the rate limit
+immediately, fails, schedules a retry, and the retry hits the rate limit again — consuming log
+space, wasting process resources, and potentially deepening the rate limit penalty.
+
+Rate limit detection sources:
+
+- Agent event with rate limit status `rejected` (for example a `rate_limit_event` with
+  `status: "rejected"` from the Claude Code provider, or equivalent signal from other providers).
+- Agent worker exit with a `rate_limited` error type.
+- HTTP 429 responses from agent APIs (if the provider surfaces them).
+
+Required orchestrator behavior:
+
+1. When a rate limit rejection is detected, record `rate_limit_paused_until` in orchestrator state.
+   - Use the `resets_at` timestamp from the rate limit payload when available.
+   - If no reset timestamp is available, use a conservative default (5 minutes from now).
+   - Convert the value to an absolute timestamp (not a relative delay) so it survives across ticks.
+
+2. While `rate_limit_paused_until` is in the future:
+   - Skip all new dispatch (Steps 3-5 of the poll tick in Section 8.1).
+   - Continue reconciliation (stall detection and tracker state refresh) so the orchestrator can
+     still stop runs whose issues become terminal.
+   - Log a periodic status message (recommended: once per minute) with the remaining pause duration
+     so operators know the service is alive and waiting, not stuck.
+   - Schedule the next tick at `min(remaining_pause_ms + 1000, 60000)` instead of the normal poll
+     interval, so the orchestrator resumes promptly when the pause expires.
+
+3. When the pause expires:
+   - Clear `rate_limit_paused_until`.
+   - Log "Rate limit expired, resuming dispatch."
+   - Resume normal tick behavior.
+
+4. Worker exit handling for rate-limited workers:
+   - Do NOT schedule an exponential backoff retry. The worker did not fail due to a bug; it failed
+     because the API quota is exhausted.
+   - Release the issue's claim so it becomes eligible for dispatch after the pause expires.
+   - Do NOT increment the retry attempt counter for rate limit failures.
+
+5. If multiple workers report rate limits concurrently, use the latest (furthest-future)
+   `resets_at` value.
+
+Observability:
+
+- The runtime snapshot (Section 13.3) should include `rate_limit_paused_until` (ISO timestamp or
+  null) so dashboards can display the pause state.
+- If a human-readable status surface is implemented, it should show a prominent indicator when
+  dispatch is paused due to rate limits.
+
 ### 8.5 Active Run Reconciliation
 
 Reconciliation runs every tick and has two parts.
@@ -1340,8 +1392,37 @@ Required extractions:
 
 - `rate_limit_info`: forward to the orchestrator's `codex_rate_limits` state field for dashboard
   display.
-- If `status` is not `allowed`, the orchestrator should log a warning. A `rate_limit_event` with
-  `status: "blocked"` means the next turn will likely fail or be delayed.
+- If `status` is not `allowed`, the orchestrator should log a warning.
+
+Required behavior on `status: "rejected"`:
+
+- A `rate_limit_event` with `status: "rejected"` means the API quota is exhausted and no further
+  requests will succeed until `resetsAt`.
+- The client MUST immediately terminate the current CLI subprocess (it cannot make progress).
+- The client MUST throw/return a `rate_limited` error with the `resetsAt` timestamp so the
+  orchestrator can activate the global dispatch pause (Section 8.4.1).
+- The client MUST NOT treat this as a normal turn failure — the error type must be distinguishable
+  from `turn_failed` so the orchestrator can avoid scheduling exponential backoff retries.
+
+Example rejected payload:
+
+```json
+{
+  "type": "rate_limit_event",
+  "rate_limit_info": {
+    "status": "rejected",
+    "resetsAt": 1773745200,
+    "rateLimitType": "five_hour",
+    "overageStatus": "rejected",
+    "overageDisabledReason": "org_level_disabled",
+    "isUsingOverage": false
+  },
+  "session_id": "<uuid>"
+}
+```
+
+Without this handling, the orchestrator enters a destructive loop: dispatch → rate limited → retry
+→ rate limited → retry, burning through process resources and log space while making zero progress.
 
 #### 10A.4.5 Result Event (Turn Completion)
 
@@ -2331,8 +2412,12 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 - Retry queue entries include attempt, due time, identifier, and error
 - Stall detection kills stalled sessions and schedules retry
 - Slot exhaustion requeues retries with explicit error reason
-- If a snapshot API is implemented, it returns running rows, retry rows, token totals, and rate
-  limits
+- Rate-limited worker exit sets `rate_limit_paused_until` and does NOT schedule exponential backoff
+- While rate-limit paused, dispatch is skipped but reconciliation continues
+- Rate-limit pause expires at `resets_at` timestamp and dispatch resumes
+- Rate-limited worker's claim is released (not left in claimed set)
+- If a snapshot API is implemented, it returns running rows, retry rows, token totals, rate
+  limits, and `rate_limit_paused_until`
 - If a snapshot API is implemented, timeout/unavailable cases are surfaced
 
 ### 17.5 Coding-Agent App-Server Client
@@ -2389,6 +2474,11 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 - No orphaned `claude` processes remain after timeout or cancellation
 - Token counts include `cache_read_input_tokens` in the effective input total
 - `--resume` failures fall back to a fresh turn with the full rendered prompt
+- `rate_limit_event` with `status: "rejected"` immediately kills the subprocess and throws
+  `rate_limited` error (not `turn_failed`)
+- `rate_limited` error includes the `resetsAt` timestamp from the rate limit payload
+- `rate_limited` worker exit does not schedule exponential backoff retry
+- `rate_limited` worker exit triggers orchestrator-level dispatch pause (Section 8.4.1)
 
 ### 17.6 Observability
 
